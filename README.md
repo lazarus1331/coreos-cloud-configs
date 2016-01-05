@@ -11,3 +11,5 @@ The [coreos-vagrant](https://github.com/coreos/coreos-vagrant.git) was used in t
 If using coreos-vagrant:
 Copy the cloud-config you want to use into the coreos-vagrant directory, and name it 'user-data'. Then run ```vagrant up```
 
+# Credits
+Based upon the excellent work of [Jeff Lindsay](http://progrium.com/blog/2014/08/20/consul-service-discovery-with-docker/)
