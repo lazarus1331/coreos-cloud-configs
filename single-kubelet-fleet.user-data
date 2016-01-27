@@ -1,0 +1,149 @@
+#cloud-config
+
+coreos:
+  etcd2:
+    #generate a new token for each unique cluster from https://discovery.etcd.io/new?size=1
+    discovery: https://discovery.etcd.io/<token>
+    # multi-region and multi-cloud deployments need to use $public_ipv4
+    advertise-client-urls: http://$public_ipv4:2379
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    # listen on both the official ports and the legacy ports
+    # legacy ports can be omitted if your application doesn't depend on them
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+  fleet:
+    public-ip: $public_ipv4
+  flannel:
+    interface: $public_ipv4
+  units:
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+    - name: docker-tcp.socket
+      command: start
+      enable: true
+      content: |
+        [Unit]
+        Description=Docker Socket for the API
+
+        [Socket]
+        ListenStream=2375
+        Service=docker.service
+        BindIPv6Only=both
+
+        [Install]
+        WantedBy=sockets.target
+
+    - name: consul.service
+      command: start
+      content: |
+        [Unit]
+        Description=Consul Server Agent
+        After=docker.service
+        After=etcd2.service
+        [Service]
+        Environment=GOMAXPROCS=2
+        Restart=on-failure
+        RestartSec=60
+        ExecStartPre=/usr/bin/docker pull progrium/consul
+        ExecStartPre=-/usr/bin/docker kill consul
+        ExecStartPre=-/usr/bin/docker rm consul
+        ExecStart=/bin/sh -c "/usr/bin/docker run \
+          --name consul \
+          -h node1 \
+          -p 8400:8400 -p 8500:8500 -p 8600:53/udp \
+          progrium/consul -server -bootstrap"\
+        ExecStop=/usr/bin/docker stop consul
+
+    - name: consul-announce.service
+      command: start
+      content: |
+        [Unit]
+        Description=Consul Server Announcer
+        PartOf=consul.service
+        After=consul.service
+        [Service]
+        EnvironmentFile=/etc/environment
+        ExecStart=/bin/sh -c "while true; do etcdctl set /consul/bootstrap/machines/$(cat /etc/machine-id) $private_ipv4 --ttl 60; \
+          /usr/bin/docker exec consul consul join $(etcdctl get $(etcdctl ls /consul/bootstrap/machines | tail -1)); sleep 45; done"
+        ExecStop=/bin/sh -c "/usr/bin/etcdctl rm /consul/bootstrap/machines/$(cat /etc/machine-id)"
+
+    - name: registrator.service
+      runtime: true
+      command: start
+      content: |
+        [Unit]
+        Description=Registrator
+        After=consul.service
+        Requires=consul.service
+        [Service]
+        Restart=always
+        RestartSec=60
+        ExecStartPre=/usr/bin/docker pull gliderlabs/registrator:latest
+        ExecStartPre=-/usr/bin/docker kill registrator
+        ExecStartPre=-/usr/bin/docker rm registrator
+        ExecStart=/bin/sh -c "/usr/bin/docker run \
+          --name registrator \
+          --net host \
+          -v /var/run/docker.sock:/tmp/docker.sock \
+          gliderlabs/registrator:latest \
+          consul://$private_ipv4:8500"
+        ExecStop=/usr/bin/docker rm -f registrator
+
+    - name: cadvisor.service
+      command: start
+      content: |
+        [Unit]
+        Description=cAdvisor container running as a service
+        After=docker.service
+        [Service]
+        ExecStartPre=/usr/bin/docker pull google/cadvisor:latest
+        ExecStartPre=-/usr/bin/docker kill cadvisor
+        ExecStartPre=-/usr/bin/docker rm cadvisor
+        ExecStart=/bin/sh -c "docker run \
+          -v /:/rootfs:ro \
+          -v /var/run:/var/run:rw \
+          -v /sys:/sys:ro \
+          -v /var/lib/docker/:/var/lib/docker:ro \
+          -p 3080:8080 \
+          --name=cadvisor \
+          google/cadvisor:latest"
+        ExecStop=/usr/bin/docker stop cadvisor
+
+    - name: kubernetes-cluster.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes container for single node cluster
+        After=etcd2.service
+        After=docker.service
+        After=consul.service
+        [Service]
+        TimeoutStartSec=10m
+        ExecStartPre=/usr/bin/docker pull gcr.io/google_containers/hyperkube:v1.1.1
+        ExecStartPre=-/usr/bin/docker kill kubelet
+        ExecStartPre=-/usr/bin/docker rm kubelet
+        ExecStart=/bin/sh -c "docker run \
+        -v /:/rootfs:ro \
+        -v /sys:/sys:ro \
+        -v /dev:/dev \
+        -v /var/lib/docker/:/var/lib/docker:rw \
+        -v /var/lib/kubelet/:/var/lib/kubelet:rw \
+        -v /var/run:/var/run:rw \
+        --name=kubelet \
+        --net=host \
+        --pid=host \
+        --privileged=true \
+        gcr.io/google_containers/hyperkube:v1.1.1 \
+        /hyperkube kubelet \
+            --containerized \
+            --hostname-override="127.0.0.1" \
+            --address="0.0.0.0" \
+            --api-servers=http://localhost:8080 \
+            --config=/etc/kubernetes/manifests \
+            --cluster-dns=10.0.0.10 \
+            --cluster-domain=cluster.local \
+            --allow-privileged=true --v=10"
+        ExecStop=/usr/bin/docker stop kubelet
+
